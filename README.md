@@ -69,10 +69,16 @@ cargo run -- info --backend placeholder
 
 ## Run (CPU backend)
 
-The CPU backend expects an ONNX model plus token IDs (until tokenizer support lands).
+The CPU backend can use a tokenizer to convert prompts into token IDs and decode output tokens.
 
 ```bash
 cargo run --features cpu -- run --backend cpu --model path/to/model.onnx --input-ids "1,2,3" --prompt "Hello" --max-tokens 64
+```
+
+To use tokenizer support, pass a local tokenizer or URL:
+
+```bash
+cargo run --features cpu -- run --backend cpu --model path/to/model.onnx --tokenizer path/to/tokenizer.json --prompt "Hello" --max-tokens 64
 ```
 
 On Windows, you may need a compatible ONNX Runtime DLL (>= 1.23). If you have multiple versions installed, point to the correct one:
@@ -85,6 +91,7 @@ If you omit `--model`, you can provide a URL instead and it will auto-download i
 
 ```bash
 $env:CPU_MODEL_URL = "https://huggingface.co/onnx-community/Qwen2.5-1.5B/resolve/main/onnx/model_int8.onnx?download=true"
+$env:CPU_TOKENIZER_URL = "https://huggingface.co/onnx-community/Qwen2.5-1.5B/resolve/main/tokenizer.json?download=true"
 cargo run --features cpu -- run --backend cpu --input-ids "1,2,3" --prompt "Hello" --max-tokens 64
 ```
 

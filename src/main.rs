@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use llm_toy::{load_model, InferenceRequest, ModelConfig};
 use std::fs;
@@ -20,6 +20,10 @@ enum Commands {
         model: Option<PathBuf>,
         #[arg(long)]
         model_url: Option<String>,
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long)]
+        tokenizer_url: Option<String>,
         #[arg(long, default_value = "placeholder")]
         backend: String,
         #[arg(long)]
@@ -32,6 +36,8 @@ enum Commands {
         output_name: Option<String>,
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
+        #[arg(long)]
+        eos_token_id: Option<i64>,
     },
     Info {
         #[arg(long)]
@@ -110,6 +116,30 @@ fn ensure_model_from_url(model_url: &str) -> Result<PathBuf> {
     Ok(model_path)
 }
 
+fn ensure_tokenizer_from_url(tokenizer_url: &str) -> Result<PathBuf> {
+    let cache_dir = default_cache_dir()?;
+    fs::create_dir_all(&cache_dir)?;
+
+    let filename = model_filename_from_url(tokenizer_url);
+    let tokenizer_path = cache_dir.join(filename);
+    if tokenizer_path.exists() {
+        return Ok(tokenizer_path);
+    }
+
+    println!("Downloading tokenizer to {}", tokenizer_path.display());
+    let response = download_agent()?
+        .get(tokenizer_url)
+        .call()
+        .context("Failed to download tokenizer")?;
+
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(&tokenizer_path)?;
+    std::io::copy(&mut reader, &mut file)?;
+    file.flush()?;
+
+    Ok(tokenizer_path)
+}
+
 fn download_agent() -> Result<ureq::Agent> {
     let connector = native_tls::TlsConnector::new().context("Failed to init native TLS")?;
     Ok(ureq::AgentBuilder::new()
@@ -136,6 +166,35 @@ fn resolve_model_path(model: Option<PathBuf>, model_url: Option<String>, backend
             ensure_qwen_model()
         }
     }
+}
+
+fn resolve_tokenizer_path(
+    tokenizer: Option<PathBuf>,
+    tokenizer_url: Option<String>,
+    backend: &str,
+    needs_tokenizer: bool,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = tokenizer {
+        return Ok(Some(path));
+    }
+
+    let tokenizer_url = tokenizer_url.or_else(|| {
+        if backend == "cpu" {
+            std::env::var("CPU_TOKENIZER_URL").ok()
+        } else {
+            None
+        }
+    });
+
+    if let Some(url) = tokenizer_url {
+        return Ok(Some(ensure_tokenizer_from_url(&url)?));
+    }
+
+    if needs_tokenizer {
+        bail!("cpu backend requires --tokenizer or --tokenizer-url (or CPU_TOKENIZER_URL) when --input-ids is omitted");
+    }
+
+    Ok(None)
 }
 
 fn parse_input_ids(value: Option<String>) -> Result<Option<Vec<i64>>> {
@@ -165,14 +224,24 @@ fn main() -> Result<()> {
         Commands::Run {
             model,
             model_url,
+            tokenizer,
+            tokenizer_url,
             backend,
             prompt,
             input_ids,
             input_name,
             output_name,
             max_tokens,
+            eos_token_id,
         } => {
             let model = resolve_model_path(model, model_url, &backend)?;
+            let parsed_input_ids = parse_input_ids(input_ids)?;
+            let tokenizer_path = resolve_tokenizer_path(
+                tokenizer,
+                tokenizer_url,
+                &backend,
+                parsed_input_ids.is_none(),
+            )?;
             let config = ModelConfig {
                 name: model
                     .file_name()
@@ -186,9 +255,11 @@ fn main() -> Result<()> {
             let response = backend.run(&InferenceRequest {
                 prompt,
                 max_tokens,
-                input_ids: parse_input_ids(input_ids)?,
+                input_ids: parsed_input_ids,
                 input_name,
-                output_name
+                output_name,
+                tokenizer_path: tokenizer_path.map(|path| path.to_string_lossy().to_string()),
+                eos_token_id,
             })?;
             println!("{}", response.text);
         }

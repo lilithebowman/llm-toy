@@ -16,6 +16,8 @@ pub struct InferenceRequest {
     pub input_ids: Option<Vec<i64>>,
     pub input_name: Option<String>,
     pub output_name: Option<String>,
+    pub tokenizer_path: Option<String>,
+    pub eos_token_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,11 +109,17 @@ use ort::{
     tensor::{Shape, TensorElementType},
     value::{DynTensor, DynValue, Tensor, ValueType},
 };
+#[cfg(feature = "cpu")]
+use tokenizers::Tokenizer;
+#[cfg(feature = "cpu")]
+use ndarray::Axis;
 
 #[cfg(feature = "cpu")]
 pub struct CpuBackend {
     backend_name: String,
     session: Option<Session>,
+    tokenizer: Option<tokenizers::Tokenizer>,
+    tokenizer_path: Option<String>,
 }
 
 #[cfg(feature = "cpu")]
@@ -120,6 +128,8 @@ impl CpuBackend {
         Self {
             backend_name: "cpu".to_string(),
             session: None,
+            tokenizer: None,
+            tokenizer_path: None,
         }
     }
 
@@ -213,46 +223,25 @@ impl CpuBackend {
             _ => None,
         }
     }
-}
 
-#[cfg(feature = "cpu")]
-impl NpuBackend for CpuBackend {
-    fn name(&self) -> &str {
-        &self.backend_name
-    }
-
-    fn is_available(&self) -> bool {
-        true
-    }
-
-    fn load_model(&mut self, model_path: &Path) -> Result<()> {
-        if !model_path.exists() {
-            bail!("Model file not found: {}", model_path.display());
+    fn ensure_tokenizer(&mut self, path: &str) -> Result<&Tokenizer> {
+        if self.tokenizer_path.as_deref() != Some(path) {
+            let tokenizer = Tokenizer::from_file(path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {path}: {e}"))?;
+            self.tokenizer = Some(tokenizer);
+            self.tokenizer_path = Some(path.to_string());
         }
 
-        Self::init_environment()?;
-        let session = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level1)?
-            .commit_from_file(model_path)?;
-
-        self.session = Some(session);
-        Ok(())
+        self.tokenizer
+            .as_ref()
+            .context("Tokenizer is not loaded")
     }
 
-    fn run(&mut self, request: &InferenceRequest) -> Result<InferenceResponse> {
-        let session = self
-            .session
-            .as_mut()
-            .context("Model is not loaded")?;
-
-        let input_ids = request
-            .input_ids
-            .as_ref()
-            .context("cpu backend requires --input-ids")?;
-
-        let input_name = request.input_name.as_deref().unwrap_or("input_ids");
-        let output_name = request.output_name.as_deref().unwrap_or("logits");
-
+    fn build_inputs(
+        session: &Session,
+        input_ids: &[i64],
+        input_name: &str,
+    ) -> Result<Vec<(String, DynValue)>> {
         let seq_len = input_ids.len();
         let mut inputs: Vec<(String, DynValue)> = Vec::new();
 
@@ -264,7 +253,7 @@ impl NpuBackend for CpuBackend {
 
             if name == input_name {
                 let token_shape = Self::token_shape(&shape, seq_len);
-                let tensor = Self::build_int_tensor(ty, token_shape, input_ids.clone())?;
+                let tensor = Self::build_int_tensor(ty, token_shape, input_ids.to_vec())?;
                 inputs.push((name.to_string(), tensor));
                 continue;
             }
@@ -298,18 +287,144 @@ impl NpuBackend for CpuBackend {
             inputs.push((name.to_string(), tensor.into_dyn()));
         }
 
-        let outputs = session.run(inputs)?;
-        let output = outputs[output_name].try_extract_array::<f32>()?;
-        let shape = output
-            .shape()
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join("x");
-        let first = output.iter().next().copied().unwrap_or(0.0);
+        Ok(inputs)
+    }
+
+    fn pick_next_token(output: ndarray::ArrayViewD<'_, f32>) -> Result<i64> {
+        if output.ndim() == 3 {
+            let batch = output.index_axis(Axis(0), 0);
+            let seq = batch.len_of(Axis(0));
+            let logits = batch.index_axis(Axis(0), seq.saturating_sub(1));
+            let mut best_id = 0i64;
+            let mut best = f32::MIN;
+            for (idx, val) in logits.iter().enumerate() {
+                if *val > best {
+                    best = *val;
+                    best_id = idx as i64;
+                }
+            }
+            return Ok(best_id);
+        }
+
+        if output.ndim() == 2 {
+            let seq = output.len_of(Axis(0));
+            let logits = output.index_axis(Axis(0), seq.saturating_sub(1));
+            let mut best_id = 0i64;
+            let mut best = f32::MIN;
+            for (idx, val) in logits.iter().enumerate() {
+                if *val > best {
+                    best = *val;
+                    best_id = idx as i64;
+                }
+            }
+            return Ok(best_id);
+        }
+
+        bail!("Unsupported logits rank {}", output.ndim());
+    }
+}
+
+#[cfg(feature = "cpu")]
+impl NpuBackend for CpuBackend {
+    fn name(&self) -> &str {
+        &self.backend_name
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn load_model(&mut self, model_path: &Path) -> Result<()> {
+        if !model_path.exists() {
+            bail!("Model file not found: {}", model_path.display());
+        }
+
+        Self::init_environment()?;
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level1)?
+            .commit_from_file(model_path)?;
+
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn run(&mut self, request: &InferenceRequest) -> Result<InferenceResponse> {
+        let input_name = request.input_name.as_deref().unwrap_or("input_ids");
+        let output_name = request.output_name.as_deref().unwrap_or("logits");
+
+        let tokenizer = if let Some(path) = request.tokenizer_path.as_deref() {
+            self.ensure_tokenizer(path)?;
+            self.tokenizer.clone()
+        } else {
+            None
+        };
+
+        let session = self
+            .session
+            .as_mut()
+            .context("Model is not loaded")?;
+
+        let mut all_ids = if let Some(ids) = request.input_ids.as_ref() {
+            ids.clone()
+        } else {
+            let tokenizer = tokenizer
+                .as_ref()
+                .context("cpu backend requires a tokenizer when --input-ids is omitted")?;
+            let encoding = tokenizer
+                .encode(request.prompt.as_str(), true)
+                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))?;
+            encoding.get_ids().iter().map(|id| *id as i64).collect()
+        };
+
+        let mut last_shape_first: Option<(String, f32)> = None;
+        if request.max_tokens == 0 {
+            if let Some(tokenizer) = tokenizer.as_ref() {
+                let text = tokenizer
+                    .decode(&all_ids.iter().map(|v| *v as u32).collect::<Vec<u32>>(), true)
+                    .map_err(|e| anyhow::anyhow!("Failed to decode tokens: {e}"))?;
+                return Ok(InferenceResponse { text });
+            }
+            return Ok(InferenceResponse { text: request.prompt.clone() });
+        }
+
+        for _ in 0..request.max_tokens {
+            let inputs = Self::build_inputs(session, &all_ids, input_name)?;
+            let outputs = session.run(inputs)?;
+            let output = outputs[output_name].try_extract_array::<f32>()?;
+            let next_id = Self::pick_next_token(output.view())?;
+            let shape = output
+                .shape()
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("x");
+            let first = output.iter().next().copied().unwrap_or(0.0);
+            last_shape_first = Some((shape, first));
+            all_ids.push(next_id);
+
+            if let Some(eos) = request.eos_token_id {
+                if next_id == eos {
+                    break;
+                }
+            }
+        }
+
+        if let Some(tokenizer) = tokenizer.as_ref() {
+            let ids: Vec<u32> = all_ids.iter().map(|v| *v as u32).collect();
+            let text = tokenizer
+                .decode(&ids, true)
+                .map_err(|e| anyhow::anyhow!("Failed to decode tokens: {e}"))?;
+            return Ok(InferenceResponse { text });
+        }
+
+        if let Some((shape, first)) = last_shape_first {
+            return Ok(InferenceResponse {
+                text: format!("[cpu] output shape={} first={}", shape, first),
+            });
+        }
 
         Ok(InferenceResponse {
-            text: format!("[cpu] output shape={} first={}", shape, first),
+            text: "[cpu] no output".to_string(),
         })
     }
 }
