@@ -184,20 +184,42 @@ fn save_memory(path: &PathBuf, state: &MemoryState) -> Result<()> {
 }
 
 fn apply_memory(prompt: &str, memory: &MemoryState) -> String {
+    const MAX_MEMORY_CHARS: usize = 1000;
+
+    fn compact(text: &str) -> String {
+        let mut s = text.replace(['\r', '\n'], " ");
+        if s.len() > MAX_MEMORY_CHARS {
+            s.truncate(MAX_MEMORY_CHARS);
+        }
+        s
+    }
+
     let mut combined = String::new();
     if let Some(prev) = memory.last_prompt.as_ref() {
-        combined.push_str("Previous prompt:\n");
-        combined.push_str(prev);
-        combined.push_str("\n\n");
+        combined.push_str("User: ");
+        combined.push_str(&compact(prev));
+        combined.push('\n');
     }
     if let Some(resp) = memory.last_response.as_ref() {
-        combined.push_str("Previous response:\n");
-        combined.push_str(resp);
-        combined.push_str("\n\n");
+        combined.push_str("Assistant: ");
+        combined.push_str(&compact(resp));
+        combined.push('\n');
     }
-    combined.push_str("Current prompt:\n");
+    combined.push_str("User: ");
     combined.push_str(prompt);
+    combined.push_str("\nAssistant:");
     combined
+}
+
+fn clean_answer(original_prompt: &str, answer: &str) -> String {
+    let mut out = answer.trim().to_string();
+    if let Some(idx) = out.rfind("Assistant:") {
+        out = out[idx + "Assistant:".len()..].trim_start().to_string();
+    }
+    if out.starts_with(original_prompt) {
+        out = out[original_prompt.len()..].trim_start().to_string();
+    }
+    out
 }
 
 fn download_agent() -> Result<ureq::Agent> {
@@ -359,15 +381,12 @@ fn main() -> Result<()> {
                 repetition_penalty,
                 seed,
             })?;
-            let mut answer = response.text.clone();
-            if answer.starts_with(&original_prompt) {
-                answer = answer[original_prompt.len()..].trim_start().to_string();
-            }
+            let answer = clean_answer(&original_prompt, &response.text);
             println!("Q: {}", original_prompt);
             println!("A: {}", answer);
             if memory {
                 memory_state.last_prompt = Some(original_prompt);
-                memory_state.last_response = Some(response.text.clone());
+                memory_state.last_response = Some(answer.clone());
                 if let Some(path) = memory_path.as_ref() {
                     save_memory(path, &memory_state)?;
                 }
