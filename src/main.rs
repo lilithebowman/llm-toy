@@ -184,30 +184,41 @@ fn save_memory(path: &PathBuf, state: &MemoryState) -> Result<()> {
 }
 
 fn apply_memory(prompt: &str, memory: &MemoryState) -> String {
-    const MAX_MEMORY_CHARS: usize = 1000;
+    const MAX_MEMORY_CHARS: usize = 2000;
+    const MAX_MEMORY_LINES: usize = 20;
 
-    fn compact(text: &str) -> String {
-        let mut s = text.replace(['\r', '\n'], " ");
+    fn clamp_text(text: &str) -> String {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines: Vec<&str> = normalized.lines().collect();
+        if lines.len() > MAX_MEMORY_LINES {
+            lines.truncate(MAX_MEMORY_LINES);
+            lines.push("[...]");
+        }
+        let mut s = lines.join("\n");
         if s.len() > MAX_MEMORY_CHARS {
             s.truncate(MAX_MEMORY_CHARS);
+            s.push_str("\n[...]");
         }
         s
     }
 
     let mut combined = String::new();
-    if let Some(prev) = memory.last_prompt.as_ref() {
-        combined.push_str("User: ");
-        combined.push_str(&compact(prev));
-        combined.push('\n');
+    if memory.last_prompt.is_some() || memory.last_response.is_some() {
+        combined.push_str("### Previous\n");
+        if let Some(prev) = memory.last_prompt.as_ref() {
+            combined.push_str("User:\n");
+            combined.push_str(&clamp_text(prev));
+            combined.push_str("\n\n");
+        }
+        if let Some(resp) = memory.last_response.as_ref() {
+            combined.push_str("Assistant:\n");
+            combined.push_str(&clamp_text(resp));
+            combined.push_str("\n\n");
+        }
     }
-    if let Some(resp) = memory.last_response.as_ref() {
-        combined.push_str("Assistant: ");
-        combined.push_str(&compact(resp));
-        combined.push('\n');
-    }
-    combined.push_str("User: ");
+    combined.push_str("### Current\nUser:\n");
     combined.push_str(prompt);
-    combined.push_str("\nAssistant:");
+    combined.push_str("\n\nAssistant:");
     combined
 }
 
@@ -383,7 +394,7 @@ fn main() -> Result<()> {
             })?;
             let answer = clean_answer(&original_prompt, &response.text);
             println!("Q: {}", original_prompt);
-            println!("A: {}", answer);
+            println!("A:\n{}", answer);
             if memory {
                 memory_state.last_prompt = Some(original_prompt);
                 memory_state.last_response = Some(answer.clone());
