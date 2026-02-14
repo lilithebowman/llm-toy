@@ -38,13 +38,13 @@ enum Commands {
         max_tokens: usize,
         #[arg(long)]
         eos_token_id: Option<i64>,
-        #[arg(long, default_value_t = 0.7)]
+        #[arg(long, default_value_t = 0.5)]
         temperature: f32,
-        #[arg(long, default_value_t = 40)]
+        #[arg(long, default_value_t = 20)]
         top_k: usize,
-        #[arg(long, default_value_t = 0.9)]
+        #[arg(long, default_value_t = 0.85)]
         top_p: f32,
-        #[arg(long, default_value_t = 1.1)]
+        #[arg(long, default_value_t = 1.2)]
         repetition_penalty: f32,
         #[arg(long)]
         seed: Option<u64>,
