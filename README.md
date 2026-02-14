@@ -89,6 +89,12 @@ Sampling controls (optional):
 - `--repetition-penalty` (default 1.0)
 - `--seed` (for reproducibility)
 
+Memory (optional):
+
+- `--memory` to include the previous prompt/response in the next prompt.
+- `--memory-file` to override the cache location.
+- `--memory-clear` to reset the stored memory.
+
 On Windows, you may need a compatible ONNX Runtime DLL (>= 1.23). If you have multiple versions installed, point to the correct one:
 
 ```powershell

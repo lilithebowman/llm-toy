@@ -48,6 +48,12 @@ enum Commands {
         repetition_penalty: f32,
         #[arg(long)]
         seed: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        memory: bool,
+        #[arg(long)]
+        memory_file: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        memory_clear: bool,
     },
     Info {
         #[arg(long)]
@@ -150,6 +156,50 @@ fn ensure_tokenizer_from_url(tokenizer_url: &str) -> Result<PathBuf> {
     Ok(tokenizer_path)
 }
 
+fn default_memory_path() -> Result<PathBuf> {
+    let cache_dir = default_cache_dir()?;
+    fs::create_dir_all(&cache_dir)?;
+    Ok(cache_dir.join("memory.json"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct MemoryState {
+    last_prompt: Option<String>,
+    last_response: Option<String>,
+}
+
+fn load_memory(path: &PathBuf) -> Result<MemoryState> {
+    if !path.exists() {
+        return Ok(MemoryState::default());
+    }
+    let data = fs::read_to_string(path)?;
+    let state = serde_json::from_str(&data).unwrap_or_default();
+    Ok(state)
+}
+
+fn save_memory(path: &PathBuf, state: &MemoryState) -> Result<()> {
+    let data = serde_json::to_string_pretty(state)?;
+    fs::write(path, data)?;
+    Ok(())
+}
+
+fn apply_memory(prompt: &str, memory: &MemoryState) -> String {
+    let mut combined = String::new();
+    if let Some(prev) = memory.last_prompt.as_ref() {
+        combined.push_str("Previous prompt:\n");
+        combined.push_str(prev);
+        combined.push_str("\n\n");
+    }
+    if let Some(resp) = memory.last_response.as_ref() {
+        combined.push_str("Previous response:\n");
+        combined.push_str(resp);
+        combined.push_str("\n\n");
+    }
+    combined.push_str("Current prompt:\n");
+    combined.push_str(prompt);
+    combined
+}
+
 fn download_agent() -> Result<ureq::Agent> {
     let connector = native_tls::TlsConnector::new().context("Failed to init native TLS")?;
     Ok(ureq::AgentBuilder::new()
@@ -248,6 +298,9 @@ fn main() -> Result<()> {
             top_p,
             repetition_penalty,
             seed,
+            memory,
+            memory_file,
+            memory_clear,
         } => {
             let model = resolve_model_path(model, model_url, &backend)?;
             let parsed_input_ids = parse_input_ids(input_ids)?;
@@ -257,6 +310,31 @@ fn main() -> Result<()> {
                 &backend,
                 parsed_input_ids.is_none(),
             )?;
+            let original_prompt = prompt.clone();
+            let memory_path = if memory || memory_clear {
+                Some(memory_file.unwrap_or(default_memory_path()?))
+            } else {
+                None
+            };
+            if memory_clear {
+                if let Some(path) = memory_path.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            let mut memory_state = if memory {
+                if let Some(path) = memory_path.as_ref() {
+                    load_memory(path)?
+                } else {
+                    MemoryState::default()
+                }
+            } else {
+                MemoryState::default()
+            };
+            let prompt = if memory {
+                apply_memory(&original_prompt, &memory_state)
+            } else {
+                original_prompt.clone()
+            };
             let config = ModelConfig {
                 name: model
                     .file_name()
@@ -281,7 +359,19 @@ fn main() -> Result<()> {
                 repetition_penalty,
                 seed,
             })?;
-            println!("{}", response.text);
+            let mut answer = response.text.clone();
+            if answer.starts_with(&original_prompt) {
+                answer = answer[original_prompt.len()..].trim_start().to_string();
+            }
+            println!("Q: {}", original_prompt);
+            println!("A: {}", answer);
+            if memory {
+                memory_state.last_prompt = Some(original_prompt);
+                memory_state.last_response = Some(response.text.clone());
+                if let Some(path) = memory_path.as_ref() {
+                    save_memory(path, &memory_state)?;
+                }
+            }
         }
         Commands::Info { model, model_url, backend } => {
             let model = resolve_model_path(model, model_url, &backend)?;
