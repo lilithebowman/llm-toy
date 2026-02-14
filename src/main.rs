@@ -38,6 +38,16 @@ enum Commands {
         max_tokens: usize,
         #[arg(long)]
         eos_token_id: Option<i64>,
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        #[arg(long, default_value_t = 40)]
+        top_k: usize,
+        #[arg(long, default_value_t = 0.9)]
+        top_p: f32,
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        #[arg(long)]
+        seed: Option<u64>,
     },
     Info {
         #[arg(long)]
@@ -233,6 +243,11 @@ fn main() -> Result<()> {
             output_name,
             max_tokens,
             eos_token_id,
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty,
+            seed,
         } => {
             let model = resolve_model_path(model, model_url, &backend)?;
             let parsed_input_ids = parse_input_ids(input_ids)?;
@@ -260,6 +275,11 @@ fn main() -> Result<()> {
                 output_name,
                 tokenizer_path: tokenizer_path.map(|path| path.to_string_lossy().to_string()),
                 eos_token_id,
+                temperature,
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                repetition_penalty,
+                seed,
             })?;
             println!("{}", response.text);
         }

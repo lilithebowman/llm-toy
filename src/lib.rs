@@ -18,6 +18,11 @@ pub struct InferenceRequest {
     pub output_name: Option<String>,
     pub tokenizer_path: Option<String>,
     pub eos_token_id: Option<i64>,
+    pub temperature: f32,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    pub repetition_penalty: f32,
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +118,8 @@ use ort::{
 use tokenizers::Tokenizer;
 #[cfg(feature = "cpu")]
 use ndarray::Axis;
+#[cfg(feature = "cpu")]
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 #[cfg(feature = "cpu")]
 pub struct CpuBackend {
@@ -290,37 +297,110 @@ impl CpuBackend {
         Ok(inputs)
     }
 
-    fn pick_next_token(output: ndarray::ArrayViewD<'_, f32>) -> Result<i64> {
-        if output.ndim() == 3 {
+    fn pick_next_token(
+        output: ndarray::ArrayViewD<'_, f32>,
+        history: &[i64],
+        temperature: f32,
+        top_k: Option<usize>,
+        top_p: Option<f32>,
+        repetition_penalty: f32,
+        rng: &mut impl Rng,
+    ) -> Result<i64> {
+        let logits: Vec<f32> = if output.ndim() == 3 {
             let batch = output.index_axis(Axis(0), 0);
             let seq = batch.len_of(Axis(0));
-            let logits = batch.index_axis(Axis(0), seq.saturating_sub(1));
-            let mut best_id = 0i64;
-            let mut best = f32::MIN;
-            for (idx, val) in logits.iter().enumerate() {
-                if *val > best {
-                    best = *val;
-                    best_id = idx as i64;
-                }
-            }
-            return Ok(best_id);
-        }
-
-        if output.ndim() == 2 {
+            batch
+                .index_axis(Axis(0), seq.saturating_sub(1))
+                .iter()
+                .copied()
+                .collect()
+        } else if output.ndim() == 2 {
             let seq = output.len_of(Axis(0));
-            let logits = output.index_axis(Axis(0), seq.saturating_sub(1));
-            let mut best_id = 0i64;
-            let mut best = f32::MIN;
-            for (idx, val) in logits.iter().enumerate() {
-                if *val > best {
-                    best = *val;
-                    best_id = idx as i64;
+            output
+                .index_axis(Axis(0), seq.saturating_sub(1))
+                .iter()
+                .copied()
+                .collect()
+        } else {
+            bail!("Unsupported logits rank {}", output.ndim());
+        };
+
+        let mut scores: Vec<(usize, f32)> = logits
+            .into_iter()
+            .enumerate()
+            .map(|(idx, v)| (idx, v))
+            .collect();
+
+        if repetition_penalty > 1.0 && !history.is_empty() {
+            for (idx, score) in &mut scores {
+                if history.iter().any(|&t| t == *idx as i64) {
+                    if *score > 0.0 {
+                        *score /= repetition_penalty;
+                    } else {
+                        *score *= repetition_penalty;
+                    }
                 }
             }
-            return Ok(best_id);
         }
 
-        bail!("Unsupported logits rank {}", output.ndim());
+        let temp = if temperature <= 0.0 { 1.0 } else { temperature };
+        if temp != 1.0 {
+            for (_, score) in &mut scores {
+                *score /= temp;
+            }
+        }
+
+        if let Some(k) = top_k {
+            if k > 0 && k < scores.len() {
+                scores.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                scores.truncate(k);
+            }
+        }
+
+        if let Some(p) = top_p {
+            let p = p.clamp(0.0, 1.0);
+            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let mut cumulative = 0.0;
+            let mut filtered = Vec::with_capacity(scores.len());
+            let max_score = scores.first().map(|v| v.1).unwrap_or(0.0);
+            let mut denom = 0.0;
+            for (_idx, score) in scores.iter().copied() {
+                let exp = (score - max_score).exp();
+                denom += exp;
+            }
+            for (_idx, score) in scores.iter().copied() {
+                let prob = (score - max_score).exp() / denom;
+                cumulative += prob;
+                filtered.push((_idx, score));
+                if cumulative >= p && !filtered.is_empty() {
+                    break;
+                }
+            }
+            scores = filtered;
+        }
+
+        if scores.is_empty() {
+            bail!("No candidates after sampling filters");
+        }
+
+        let max_score = scores.iter().map(|v| v.1).fold(f32::NEG_INFINITY, f32::max);
+        let mut exp_sum = 0.0;
+        let mut exp_scores = Vec::with_capacity(scores.len());
+        for (_, score) in scores.iter().copied() {
+            let exp = (score - max_score).exp();
+            exp_sum += exp;
+            exp_scores.push(exp);
+        }
+
+        let mut sample = rng.gen::<f32>() * exp_sum;
+        for (i, (idx, _)) in scores.iter().enumerate() {
+            sample -= exp_scores[i];
+            if sample <= 0.0 {
+                return Ok(*idx as i64);
+            }
+        }
+
+        Ok(scores.last().unwrap().0 as i64)
     }
 }
 
@@ -387,11 +467,25 @@ impl NpuBackend for CpuBackend {
             return Ok(InferenceResponse { text: request.prompt.clone() });
         }
 
+        let mut rng = if let Some(seed) = request.seed {
+            StdRng::seed_from_u64(seed)
+        } else {
+            StdRng::from_entropy()
+        };
+
         for _ in 0..request.max_tokens {
             let inputs = Self::build_inputs(session, &all_ids, input_name)?;
             let outputs = session.run(inputs)?;
             let output = outputs[output_name].try_extract_array::<f32>()?;
-            let next_id = Self::pick_next_token(output.view())?;
+            let next_id = Self::pick_next_token(
+                output.view(),
+                &all_ids,
+                request.temperature,
+                request.top_k,
+                request.top_p,
+                request.repetition_penalty,
+                &mut rng,
+            )?;
             let shape = output
                 .shape()
                 .iter()

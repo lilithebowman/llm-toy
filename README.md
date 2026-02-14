@@ -81,6 +81,14 @@ To use tokenizer support, pass a local tokenizer or URL:
 cargo run --features cpu -- run --backend cpu --model path/to/model.onnx --tokenizer path/to/tokenizer.json --prompt "Hello" --max-tokens 64
 ```
 
+Sampling controls (optional):
+
+- `--temperature` (default 1.0)
+- `--top-k`
+- `--top-p`
+- `--repetition-penalty` (default 1.0)
+- `--seed` (for reproducibility)
+
 On Windows, you may need a compatible ONNX Runtime DLL (>= 1.23). If you have multiple versions installed, point to the correct one:
 
 ```powershell

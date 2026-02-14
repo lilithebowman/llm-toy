@@ -621,6 +621,7 @@ dependencies = [
  "native-tls",
  "ndarray",
  "ort",
+ "rand",
  "serde",
  "serde_json",
  "tokenizers",
