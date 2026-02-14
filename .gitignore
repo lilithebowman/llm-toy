@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+
+# Rust/LLVM tooling
+**/*.rlib
+**/*.rmeta
+**/*.pdb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+
+# Cache directories
+**/.cache/
+**/cache/
+
+# Copilot
+.github/copilot-instructions.md.bak

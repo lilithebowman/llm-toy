@@ -1,1 +1,1 @@
-/mnt/c/Source/llm-toy/target/debug/llm-toy: /mnt/c/Source/llm-toy/src/lib.rs /mnt/c/Source/llm-toy/src/main.rs
+C:\Source\llm-toy\target\debug\llm-toy.exe: C:\Source\llm-toy\src\lib.rs C:\Source\llm-toy\src\main.rs

@@ -4,6 +4,7 @@ use llm_toy::{load_model, InferenceRequest, ModelConfig};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "llm-toy", version, about = "Run downloaded LLM modules on a laptop NPU")]
@@ -17,16 +18,26 @@ enum Commands {
     Run {
         #[arg(long)]
         model: Option<PathBuf>,
+        #[arg(long)]
+        model_url: Option<String>,
         #[arg(long, default_value = "placeholder")]
         backend: String,
         #[arg(long)]
         prompt: String,
+        #[arg(long)]
+        input_ids: Option<String>,
+        #[arg(long)]
+        input_name: Option<String>,
+        #[arg(long)]
+        output_name: Option<String>,
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
     },
     Info {
         #[arg(long)]
         model: Option<PathBuf>,
+        #[arg(long)]
+        model_url: Option<String>,
         #[arg(long, default_value = "placeholder")]
         backend: String,
     },
@@ -51,7 +62,8 @@ fn ensure_qwen_model() -> Result<PathBuf> {
     }
 
     println!("Downloading default Qwen model to {}", model_path.display());
-    let response = ureq::get(DEFAULT_QWEN_URL)
+    let response = download_agent()?
+        .get(DEFAULT_QWEN_URL)
         .call()
         .context("Failed to download Qwen model")?;
 
@@ -63,11 +75,87 @@ fn ensure_qwen_model() -> Result<PathBuf> {
     Ok(model_path)
 }
 
-fn resolve_model_path(model: Option<PathBuf>) -> Result<PathBuf> {
+fn model_filename_from_url(model_url: &str) -> String {
+    if let Ok(url) = url::Url::parse(model_url) {
+        if let Some(name) = url.path_segments().and_then(|segments| segments.last()) {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "model.onnx".to_string()
+}
+
+fn ensure_model_from_url(model_url: &str) -> Result<PathBuf> {
+    let cache_dir = default_cache_dir()?;
+    fs::create_dir_all(&cache_dir)?;
+
+    let filename = model_filename_from_url(model_url);
+    let model_path = cache_dir.join(filename);
+    if model_path.exists() {
+        return Ok(model_path);
+    }
+
+    println!("Downloading model to {}", model_path.display());
+    let response = download_agent()?
+        .get(model_url)
+        .call()
+        .context("Failed to download model")?;
+
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(&model_path)?;
+    std::io::copy(&mut reader, &mut file)?;
+    file.flush()?;
+
+    Ok(model_path)
+}
+
+fn download_agent() -> Result<ureq::Agent> {
+    let connector = native_tls::TlsConnector::new().context("Failed to init native TLS")?;
+    Ok(ureq::AgentBuilder::new()
+        .tls_connector(Arc::new(connector))
+        .build())
+}
+
+fn resolve_model_path(model: Option<PathBuf>, model_url: Option<String>, backend: &str) -> Result<PathBuf> {
     match model {
         Some(path) => Ok(path),
-        None => ensure_qwen_model(),
+        None => {
+            if backend == "ryzen-ai" {
+                let model_url = model_url
+                    .or_else(|| std::env::var("RYZEN_AI_MODEL_URL").ok())
+                    .context("ryzen-ai backend requires --model or --model-url (or RYZEN_AI_MODEL_URL)")?;
+                return ensure_model_from_url(&model_url);
+            }
+            if backend == "cpu" {
+                let model_url = model_url
+                    .or_else(|| std::env::var("CPU_MODEL_URL").ok())
+                    .context("cpu backend requires --model or --model-url (or CPU_MODEL_URL)")?;
+                return ensure_model_from_url(&model_url);
+            }
+            ensure_qwen_model()
+        }
     }
+}
+
+fn parse_input_ids(value: Option<String>) -> Result<Option<Vec<i64>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let id: i64 = token.parse().context("Invalid token id in --input-ids")?;
+        ids.push(id);
+    }
+    Ok(Some(ids))
 }
 
 fn main() -> Result<()> {
@@ -76,11 +164,15 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Run {
             model,
+            model_url,
             backend,
             prompt,
+            input_ids,
+            input_name,
+            output_name,
             max_tokens,
         } => {
-            let model = resolve_model_path(model)?;
+            let model = resolve_model_path(model, model_url, &backend)?;
             let config = ModelConfig {
                 name: model
                     .file_name()
@@ -90,12 +182,18 @@ fn main() -> Result<()> {
                 path: model.to_string_lossy().to_string(),
                 npu_backend: backend,
             };
-            let backend = load_model(&config)?;
-            let response = backend.run(&InferenceRequest { prompt, max_tokens })?;
+            let mut backend = load_model(&config)?;
+            let response = backend.run(&InferenceRequest {
+                prompt,
+                max_tokens,
+                input_ids: parse_input_ids(input_ids)?,
+                input_name,
+                output_name
+            })?;
             println!("{}", response.text);
         }
-        Commands::Info { model, backend } => {
-            let model = resolve_model_path(model)?;
+        Commands::Info { model, model_url, backend } => {
+            let model = resolve_model_path(model, model_url, &backend)?;
             let config = ModelConfig {
                 name: model
                     .file_name()
