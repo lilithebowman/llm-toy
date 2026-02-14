@@ -162,10 +162,18 @@ fn default_memory_path() -> Result<PathBuf> {
     Ok(cache_dir.join("memory.json"))
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct MemoryEntry {
+    prompt: String,
+    response: String,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct MemoryState {
     last_prompt: Option<String>,
     last_response: Option<String>,
+    #[serde(default)]
+    conversation_history: Vec<MemoryEntry>,
 }
 
 fn load_memory(path: &PathBuf) -> Result<MemoryState> {
@@ -186,6 +194,7 @@ fn save_memory(path: &PathBuf, state: &MemoryState) -> Result<()> {
 fn apply_memory(prompt: &str, memory: &MemoryState) -> String {
     const MAX_MEMORY_CHARS: usize = 2000;
     const MAX_MEMORY_LINES: usize = 20;
+    const MAX_HISTORY: usize = 3;
 
     fn clamp_text(text: &str) -> String {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -203,8 +212,18 @@ fn apply_memory(prompt: &str, memory: &MemoryState) -> String {
     }
 
     let mut combined = String::new();
-    if memory.last_prompt.is_some() || memory.last_response.is_some() {
+    if !memory.conversation_history.is_empty() || memory.last_prompt.is_some() || memory.last_response.is_some() {
         combined.push_str("### Previous\n");
+        if !memory.conversation_history.is_empty() {
+            let start = memory.conversation_history.len().saturating_sub(MAX_HISTORY);
+            for entry in &memory.conversation_history[start..] {
+                combined.push_str("User:\n");
+                combined.push_str(&clamp_text(&entry.prompt));
+                combined.push_str("\n\nAssistant:\n");
+                combined.push_str(&clamp_text(&entry.response));
+                combined.push_str("\n\n");
+            }
+        }
         if let Some(prev) = memory.last_prompt.as_ref() {
             combined.push_str("User:\n");
             combined.push_str(&clamp_text(prev));
@@ -396,8 +415,12 @@ fn main() -> Result<()> {
             println!("Q: {}", original_prompt);
             println!("A:\n{}", answer);
             if memory {
-                memory_state.last_prompt = Some(original_prompt);
+                memory_state.last_prompt = Some(original_prompt.clone());
                 memory_state.last_response = Some(answer.clone());
+                memory_state.conversation_history.push(MemoryEntry {
+                    prompt: original_prompt,
+                    response: answer.clone(),
+                });
                 if let Some(path) = memory_path.as_ref() {
                     save_memory(path, &memory_state)?;
                 }
